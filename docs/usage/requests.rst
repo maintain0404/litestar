@@ -10,14 +10,14 @@ The body of HTTP requests can be accessed using the special ``data`` parameter i
     :language: python
 
 
-The type of ``data`` an be any supported type, including
+The type of ``data`` can be any supported type, including
 
 
 * :func:`dataclasses <dataclasses.dataclass>`
 * :class:`TypedDicts <typing.TypedDict>`
 * Pydantic models
 * Arbitrary stdlib types
-* Typed supported via :doc:`plugins </usage/plugins/index>`
+* Types supported via :doc:`plugins </usage/plugins/index>`
 
 .. literalinclude:: /examples/request_data/request_data_2.py
     :language: python

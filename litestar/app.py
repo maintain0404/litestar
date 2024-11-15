@@ -32,7 +32,7 @@ from litestar.exceptions import (
     NoRouteMatchFoundException,
 )
 from litestar.logging.config import LoggingConfig, get_logger_placeholder
-from litestar.middleware._internal import CORSMiddleware
+from litestar.middleware._internal.cors import CORSMiddleware
 from litestar.openapi.config import OpenAPIConfig
 from litestar.plugins import (
     CLIPluginProtocol,
@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     from litestar.config.compression import CompressionConfig
     from litestar.config.cors import CORSConfig
     from litestar.config.csrf import CSRFConfig
+    from litestar.contrib.opentelemetry import OpenTelemetryPlugin
     from litestar.datastructures import CacheControlHeader, ETag
     from litestar.dto import AbstractDTO
     from litestar.events.listener import EventListener
@@ -385,8 +386,10 @@ class Litestar(Router):
         for handler in chain(
             on_app_init or [],
             (p.on_app_init for p in config.plugins if isinstance(p, InitPluginProtocol)),
+            [self._patch_opentelemetry_middleware],
         ):
             config = handler(config)  # pyright: ignore
+
         self.plugins = PluginRegistry(config.plugins)
 
         self._openapi_schema: OpenAPI | None = None
@@ -412,7 +415,6 @@ class Litestar(Router):
         self.get_logger: GetLogger = get_logger_placeholder
         self.logger: Logger | None = None
         self.routes: list[HTTPRoute | ASGIRoute | WebSocketRoute] = []
-        self.asgi_router = ASGIRouter(app=self)
 
         self.after_exception = [ensure_async_callable(h) for h in config.after_exception]
         self.allowed_hosts = cast("AllowedHostsConfig | None", config.allowed_hosts)
@@ -442,12 +444,11 @@ class Litestar(Router):
         try:
             from starlette.exceptions import HTTPException as StarletteHTTPException
 
-            from litestar.middleware.exceptions.middleware import _starlette_exception_handler
+            from litestar.middleware._internal.exceptions.middleware import _starlette_exception_handler
 
             config.exception_handlers.setdefault(StarletteHTTPException, _starlette_exception_handler)
         except ImportError:
             pass
-
         super().__init__(
             after_request=config.after_request,
             after_response=config.after_response,
@@ -479,6 +480,8 @@ class Litestar(Router):
             websocket_class=self.websocket_class,
         )
 
+        self.asgi_router = ASGIRouter(app=self)
+
         for route_handler in config.route_handlers:
             self.register(route_handler)
 
@@ -490,6 +493,23 @@ class Litestar(Router):
             self.register(static_config.to_static_files_app())
 
         self.asgi_handler = self._create_asgi_handler()
+
+    @staticmethod
+    def _patch_opentelemetry_middleware(config: AppConfig) -> AppConfig:
+        # workaround to support otel middleware priority. Should be replaced by regular
+        # middleware priorities once available
+        try:
+            from litestar.contrib.opentelemetry import OpenTelemetryPlugin
+
+            if not any(isinstance(p, OpenTelemetryPlugin) for p in config.plugins):
+                config.middleware, otel_middleware = OpenTelemetryPlugin._pop_otel_middleware(config.middleware)
+                if otel_middleware:
+                    otel_plugin = OpenTelemetryPlugin()
+                    otel_plugin._middleware = otel_middleware
+                    config.plugins = [*config.plugins, otel_plugin]
+        except ImportError:
+            pass
+        return config
 
     @property
     @deprecated(version="2.6.0", kind="property", info="Use create_static_files router instead")
@@ -820,7 +840,7 @@ class Litestar(Router):
         if not isinstance(handler_fn, StaticFiles):
             raise NoRouteMatchFoundException(f"Handler with name {name} is not a static files handler")
 
-        return join_paths([handler_index["paths"][0], file_path])  # type: ignore[unreachable]
+        return join_paths([handler_index["paths"][0], file_path])
 
     @property
     def route_handler_method_view(self) -> dict[str, list[str]]:
@@ -839,13 +859,16 @@ class Litestar(Router):
 
         If CORS or TrustedHost configs are provided to the constructor, they will wrap the router as well.
         """
-        asgi_handler = wrap_in_exception_handler(
-            app=self.asgi_router,
-            exception_handlers=self.exception_handlers or {},  # pyright: ignore
-        )
+        asgi_handler = wrap_in_exception_handler(app=self.asgi_router)
 
         if self.cors_config:
-            return CORSMiddleware(app=asgi_handler, config=self.cors_config)
+            asgi_handler = CORSMiddleware(app=asgi_handler, config=self.cors_config)
+
+        try:
+            otel_plugin: OpenTelemetryPlugin = self.plugins.get("OpenTelemetryPlugin")
+            asgi_handler = otel_plugin.middleware(app=asgi_handler)
+        except KeyError:
+            pass
 
         return asgi_handler
 

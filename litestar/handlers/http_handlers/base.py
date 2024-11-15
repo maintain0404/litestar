@@ -214,8 +214,9 @@ class HTTPRouteHandler(BaseRouteHandler):
             return_dto: :class:`AbstractDTO <.dto.base_dto.AbstractDTO>` to use for serializing
                 outbound response data.
             signature_namespace: A mapping of names to types for use in forward reference resolution during signature modelling.
-            status_code: An http status code for the response. Defaults to ``200`` for mixed method or ``GET``, ``PUT`` and
-                ``PATCH``, ``201`` for ``POST`` and ``204`` for ``DELETE``.
+            status_code: An http status code for the response. Defaults to ``200`` for ``GET``, ``PUT`` and ``PATCH``,
+                ``201`` for ``POST`` and ``204`` for ``DELETE``. For mixed method requests it will check for ``POST`` and ``DELETE`` first
+                then defaults to ``200``.
             sync_to_thread: A boolean dictating whether the handler function will be executed in a worker thread or the
                 main event loop. This has an effect only for sync handler functions. See using sync handler functions.
             content_encoding: A string describing the encoding of the content, e.g. ``"base64"``.
@@ -574,7 +575,7 @@ class HTTPRouteHandler(BaseRouteHandler):
 
         if return_type.annotation is Empty:
             raise ImproperlyConfiguredException(
-                "A return value of a route handler function should be type annotated. "
+                f"A return value of a route handler function {self} should be type annotated. "
                 "If your function doesn't return a value, annotate it as returning 'None'."
             )
 
@@ -597,6 +598,13 @@ class HTTPRouteHandler(BaseRouteHandler):
 
         if "data" in self.parsed_fn_signature.parameters and "GET" in self.http_methods:
             raise ImproperlyConfiguredException("'data' kwarg is unsupported for 'GET' request handlers")
+
+        if (body_param := self.parsed_fn_signature.parameters.get("body")) and not body_param.is_subclass_of(bytes):
+            raise ImproperlyConfiguredException(
+                f"Invalid type annotation for 'body' parameter in route handler {self}. 'body' will always receive the "
+                f"raw request body as bytes but was annotated with '{body_param.raw!r}'. If you want to receive "
+                "processed request data, use the 'data' parameter."
+            )
 
 
 route = HTTPRouteHandler

@@ -1,11 +1,13 @@
 from typing import Any, Dict, List
+from unittest.mock import ANY
 
 import pydantic as pydantic_v2
 import pytest
 from pydantic import v1 as pydantic_v1
 from typing_extensions import Annotated
 
-from litestar import post
+from litestar import get, post
+from litestar.contrib.pydantic import PydanticInitPlugin, PydanticPlugin
 from litestar.contrib.pydantic.pydantic_dto_factory import PydanticDTO
 from litestar.enums import RequestEncodingType
 from litestar.params import Body, Parameter
@@ -135,7 +137,7 @@ def test_serialize_raw_errors_v2() -> None:
                 "msg": "Value error, user id must be greater than 0",
                 "input": -1,
                 "ctx": {"error": "ValueError"},
-                "url": "https://errors.pydantic.dev/2.6/v/value_error",
+                "url": ANY,
             }
         ]
 
@@ -213,8 +215,6 @@ class V2ModelWithPrivateFields(pydantic_v2.BaseModel):
         underscore_fields_are_private = True
 
     _field: str = pydantic_v2.PrivateAttr()
-    # include an invalid annotation here to ensure we never touch those fields
-    _underscore_field: "foo"  # type: ignore[name-defined] # noqa: F821
     bar: str
 
 
@@ -304,3 +304,137 @@ def test_dto_with_non_instantiable_types(base_model: BaseModelType, type_: Any, 
         res = client.post("/", json={"foo": in_})
         assert res.status_code == 201
         assert res.json() == {"foo": in_}
+
+
+@pytest.mark.parametrize(
+    "plugin_params, response",
+    (
+        (
+            {"exclude": {"alias"}},
+            {
+                "none": None,
+                "default": "default",
+            },
+        ),
+        ({"exclude_defaults": True}, {"alias": "prefer_alias"}),
+        ({"exclude_none": True}, {"alias": "prefer_alias", "default": "default"}),
+        ({"exclude_unset": True}, {"alias": "prefer_alias"}),
+        ({"include": {"alias"}}, {"alias": "prefer_alias"}),
+        ({"prefer_alias": True}, {"prefer_alias": "prefer_alias", "default": "default", "none": None}),
+    ),
+    ids=(
+        "Exclude alias field",
+        "Exclude default fields",
+        "Exclude None field",
+        "Exclude unset fields",
+        "Include alias field",
+        "Use alias in response",
+    ),
+)
+def test_params_with_v1_and_v2_models(plugin_params: dict, response: dict) -> None:
+    class ModelV1(pydantic_v1.BaseModel):  # pyright: ignore
+        alias: str = pydantic_v1.fields.Field(alias="prefer_alias")  # pyright: ignore
+        default: str = "default"
+        none: None = None
+
+        class Config:
+            allow_population_by_field_name = True
+
+    class ModelV2(pydantic_v2.BaseModel):
+        alias: str = pydantic_v2.fields.Field(serialization_alias="prefer_alias")
+        default: str = "default"
+        none: None = None
+
+    @post("/v1")
+    async def handler_v1() -> ModelV1:
+        return ModelV1(alias="prefer_alias")  # type: ignore[call-arg]
+
+    @post("/v2")
+    async def handler_v2() -> ModelV2:
+        return ModelV2(alias="prefer_alias")
+
+    with create_test_client([handler_v1, handler_v2], plugins=[PydanticPlugin(**plugin_params)]) as client:
+        assert client.post("/v1").json() == response
+        assert client.post("/v2").json() == response
+
+
+@pytest.mark.parametrize(
+    "validate_strict,expect_error",
+    [
+        (False, False),
+        (None, False),
+        (True, True),
+    ],
+)
+def test_v2_strict_validate(
+    validate_strict: bool,
+    expect_error: bool,
+) -> None:
+    # https://github.com/litestar-org/litestar/issues/3572
+
+    class Model(pydantic_v2.BaseModel):
+        test_bool: pydantic_v2.StrictBool
+
+    @post("/")
+    async def handler(data: Model) -> None:
+        return None
+
+    plugins = []
+    if validate_strict is not None:
+        plugins.append(PydanticInitPlugin(validate_strict=validate_strict))
+
+    with create_test_client([handler], plugins=plugins) as client:
+        res = client.post("/", json={"test_bool": "YES"})
+        assert res.status_code == 400 if expect_error else 201
+
+
+def test_model_defaults(pydantic_version: PydanticVersion) -> None:
+    lib = pydantic_v1 if pydantic_version == "v1" else pydantic_v2
+
+    class Model(lib.BaseModel):  # type: ignore[misc, name-defined]
+        a: int
+        b: int = lib.Field(default=1)
+        c: int = lib.Field(default_factory=lambda: 3)
+
+    @post("/")
+    async def handler(data: Model) -> Dict[str, int]:
+        return {"a": data.a, "b": data.b, "c": data.c}
+
+    with create_test_client([handler]) as client:
+        schema = client.app.openapi_schema.components.schemas["test_model_defaults.Model"]
+        res = client.post("/", json={"a": 5})
+        assert res.status_code == 201
+        assert res.json() == {"a": 5, "b": 1, "c": 3}
+        assert schema.required == ["a"]
+        assert schema.properties["b"].default == 1
+        assert schema.properties["c"].default is None
+
+
+@pytest.mark.parametrize("with_dto", [True, False])
+def test_v2_computed_fields(with_dto: bool) -> None:
+    # https://github.com/litestar-org/litestar/issues/3656
+
+    class Model(pydantic_v2.BaseModel):
+        foo: int = 1
+
+        @pydantic_v2.computed_field
+        def bar(self) -> int:
+            return 2
+
+        @pydantic_v2.computed_field(examples=[1], json_schema_extra={"title": "this is computed"})
+        def baz(self) -> int:
+            return 3
+
+    @get("/", return_dto=PydanticDTO[Model] if with_dto else None)
+    async def handler() -> Model:
+        return Model()
+
+    component_name = "HandlerModelResponseBody" if with_dto else "test_v2_computed_fields.Model"
+
+    with create_test_client([handler]) as client:
+        schema = client.app.openapi_schema.components.schemas[component_name]
+        res = client.get("/")
+        assert list(schema.properties.keys()) == ["foo", "bar", "baz"]
+        assert schema.properties["baz"].title == "this is computed"
+        assert schema.properties["baz"].examples == [1]
+        assert res.json() == {"foo": 1, "bar": 2, "baz": 3}

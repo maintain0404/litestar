@@ -40,7 +40,6 @@ from litestar._openapi.schema_generation.constrained_fields import (
     create_string_constrained_field_schema,
 )
 from litestar._openapi.schema_generation.utils import (
-    _get_normalized_schema_key,
     _should_create_enum_schema,
     _should_create_literal_schema,
     _type_or_first_not_none_inner_type,
@@ -63,6 +62,7 @@ from litestar.utils.predicates import (
 from litestar.utils.typing import (
     get_origin_or_inner_type,
     make_non_optional_union,
+    unwrap_new_type,
 )
 
 if TYPE_CHECKING:
@@ -325,7 +325,11 @@ class SchemaCreator:
 
         result: Schema | Reference
 
-        if plugin_for_annotation := self.get_plugin_for(field_definition):
+        if field_definition.is_new_type:
+            result = self.for_new_type(field_definition)
+        elif field_definition.is_type_alias_type:
+            result = self.for_type_alias_type(field_definition)
+        elif plugin_for_annotation := self.get_plugin_for(field_definition):
             result = self.for_plugin(field_definition, plugin_for_annotation)
         elif _should_create_enum_schema(field_definition):
             annotation = _type_or_first_not_none_inner_type(field_definition)
@@ -343,16 +347,37 @@ class SchemaCreator:
             result = self.for_union_field(field_definition)
         elif field_definition.is_type_var:
             result = self.for_typevar()
-        elif field_definition.inner_types and not field_definition.is_generic:
-            result = self.for_object_type(field_definition)
         elif self.is_constrained_field(field_definition):
             result = self.for_constrained_field(field_definition)
+        elif field_definition.inner_types and not field_definition.is_generic:
+            # this case does not recurse for all base cases, so it needs to happen
+            # after all non-concrete cases
+            result = self.for_object_type(field_definition)
         elif field_definition.is_subclass_of(UploadFile):
             result = self.for_upload_file(field_definition)
         else:
             result = create_schema_for_annotation(field_definition.annotation)
 
         return self.process_schema_result(field_definition, result) if isinstance(result, Schema) else result
+
+    def for_new_type(self, field_definition: FieldDefinition) -> Schema | Reference:
+        return self.for_field_definition(
+            FieldDefinition.from_kwarg(
+                annotation=unwrap_new_type(field_definition.annotation),
+                name=field_definition.name,
+                default=field_definition.default,
+            )
+        )
+
+    def for_type_alias_type(self, field_definition: FieldDefinition) -> Schema | Reference:
+        return self.for_field_definition(
+            FieldDefinition.from_kwarg(
+                annotation=field_definition.annotation.__value__,
+                name=field_definition.name,
+                default=field_definition.default,
+                kwarg_definition=field_definition.kwarg_definition,
+            )
+        )
 
     @staticmethod
     def for_upload_file(field_definition: FieldDefinition) -> Schema:
@@ -460,7 +485,7 @@ class SchemaCreator:
         if field_definition.is_non_string_sequence or field_definition.is_non_string_iterable:
             # filters out ellipsis from tuple[int, ...] type annotations
             inner_types = (f for f in field_definition.inner_types if f.annotation is not Ellipsis)
-            items = list(map(self.for_field_definition, inner_types or ()))
+            items = list(map(self.for_field_definition, inner_types))
 
             return Schema(
                 type=OpenAPIType.ARRAY,
@@ -484,8 +509,7 @@ class SchemaCreator:
         Returns:
             A schema instance.
         """
-        key = _get_normalized_schema_key(field_definition.annotation)
-        if (ref := self.schema_registry.get_reference_for_key(key)) is not None:
+        if (ref := self.schema_registry.get_reference_for_field_definition(field_definition)) is not None:
             return ref
 
         schema = plugin.to_openapi_schema(field_definition=field_definition, schema_creator=self)
@@ -514,7 +538,7 @@ class SchemaCreator:
         kwarg_definition = cast(Union[ParameterKwarg, BodyKwarg], field.kwarg_definition)
         if any(is_class_and_subclass(field.annotation, t) for t in (int, float, Decimal)):
             return create_numerical_constrained_field_schema(field.annotation, kwarg_definition)
-        if any(is_class_and_subclass(field.annotation, t) for t in (str, bytes)):  # type: ignore[arg-type]
+        if any(is_class_and_subclass(field.annotation, t) for t in (str, bytes)):
             return create_string_constrained_field_schema(field.annotation, kwarg_definition)
         if any(is_class_and_subclass(field.annotation, t) for t in (date, datetime)):
             return create_date_constrained_field_schema(field.annotation, kwarg_definition)
@@ -535,19 +559,14 @@ class SchemaCreator:
             schema.min_items = kwarg_definition.min_items
         if kwarg_definition.max_items:
             schema.max_items = kwarg_definition.max_items
-        if any(is_class_and_subclass(field_definition.annotation, t) for t in (set, frozenset)):  # type: ignore[arg-type]
+        if any(is_class_and_subclass(field_definition.annotation, t) for t in (set, frozenset)):
             schema.unique_items = True
 
         item_creator = self.not_generating_examples
         if field_definition.inner_types:
             items = list(map(item_creator.for_field_definition, field_definition.inner_types))
             schema.items = Schema(one_of=items) if len(items) > 1 else items[0]
-        else:
-            schema.items = item_creator.for_field_definition(
-                FieldDefinition.from_kwarg(
-                    field_definition.annotation.item_type, f"{field_definition.annotation.__name__}Field"
-                )
-            )
+        # INFO: Removed because it was only for pydantic constrained collections
         return schema
 
     def process_schema_result(self, field: FieldDefinition, schema: Schema) -> Schema | Reference:
@@ -572,7 +591,9 @@ class SchemaCreator:
                         setattr(schema, schema_key, value)
 
             if isinstance(field.kwarg_definition, KwargDefinition) and (extra := field.kwarg_definition.schema_extra):
+                field_aliases = schema.field_aliases()
                 for schema_key, value in extra.items():
+                    schema_key = field_aliases.get(schema_key, schema_key)
                     if not hasattr(schema, schema_key):
                         raise ValueError(
                             f"`schema_extra` declares key `{schema_key}` which does not exist in `Schema` object"
@@ -588,8 +609,7 @@ class SchemaCreator:
             schema.examples = get_json_schema_formatted_examples(create_examples_for_field(field))
 
         if schema.title and schema.type == OpenAPIType.OBJECT:
-            key = _get_normalized_schema_key(field.annotation)
-            return self.schema_registry.get_reference_for_key(key) or schema
+            return self.schema_registry.get_reference_for_field_definition(field) or schema
         return schema
 
     def create_component_schema(
@@ -620,7 +640,7 @@ class SchemaCreator:
         Returns:
             A schema instance.
         """
-        schema = self.schema_registry.get_schema_for_key(_get_normalized_schema_key(type_.annotation))
+        schema = self.schema_registry.get_schema_for_field_definition(type_)
         schema.title = title or _get_type_schema_name(type_)
         schema.required = required
         schema.type = openapi_type

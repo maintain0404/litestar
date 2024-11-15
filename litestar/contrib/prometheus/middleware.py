@@ -115,9 +115,12 @@ class PrometheusMiddleware(AbstractMiddleware):
             A dictionary of default labels.
         """
 
+        path = request.url.path
+        if self._config.group_path:
+            path = request.scope["path_template"]
         return {
             "method": request.method if request.scope["type"] == ScopeType.HTTP else request.scope["type"],
-            "path": request.url.path,
+            "path": path,
             "status_code": 200,
             "app_name": self._config.app_name,
         }

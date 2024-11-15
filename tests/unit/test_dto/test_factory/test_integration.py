@@ -967,7 +967,7 @@ from typing import Generic, List, TypeVar
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from litestar import Litestar, get
-from litestar.contrib.sqlalchemy.dto import SQLAlchemyDTO
+from litestar.plugins.sqlalchemy import SQLAlchemyDTO
 from litestar.dto import DTOConfig
 
 T = TypeVar("T")
@@ -999,7 +999,85 @@ app = Litestar(route_handlers=[get_users])
 """
     )
     openapi = cast("Litestar", module.app).openapi_schema
-    schema = openapi.components.schemas["WithCount[litestar.dto._backend.GetUsersUserResponseBody]"]
+    schema = openapi.components.schemas["WithCount_litestar.dto._backend.GetUsersUserResponseBody_"]
     assert not_none(schema.properties).keys() == {"count", "data"}
     model_schema = openapi.components.schemas["GetUsersUserResponseBody"]
     assert not_none(model_schema.properties).keys() == {"id", "name"}
+
+
+def test_openapi_schema_for_dto_includes_body_examples(create_module: Callable[[str], ModuleType]) -> None:
+    module = create_module(
+        """
+from dataclasses import dataclass
+from uuid import UUID
+
+from typing_extensions import Annotated
+
+from litestar import Litestar, post
+from litestar.dto import DataclassDTO
+from litestar.openapi.spec import Example
+from litestar.params import Body
+
+
+@dataclass
+class Item:
+    id: UUID
+    name: str
+
+
+body = Body(
+    title="Create item",
+    description="Create a new item.",
+    examples=[
+        Example(
+            summary="Post is Ok",
+            value={
+                "id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+                "name": "Swatch",
+            },
+        )
+    ],
+)
+
+
+@post()
+async def create_item(data: Annotated[Item, body]) -> Item:
+    return data
+
+
+@post("dto", dto=DataclassDTO[Item])
+async def create_item_with_dto(data: Annotated[Item, body]) -> Item:
+    return data
+
+
+app = Litestar(route_handlers=[create_item, create_item_with_dto])
+"""
+    )
+
+    openapi_schema = module.app.openapi_schema
+    item_schema = openapi_schema.components.schemas["Item"]
+    item_with_dto_schema = openapi_schema.components.schemas["CreateItemWithDtoItemRequestBody"]
+    assert item_schema.examples == item_with_dto_schema.examples
+
+
+@pytest.mark.parametrize("forbid_unknown_fields, expected_status_code", [(False, 201), (True, 400)])
+def test_forbid_unknown_fields(
+    use_experimental_dto_backend: bool, forbid_unknown_fields: bool, expected_status_code: int
+) -> None:
+    @dataclass
+    class Foo:
+        bar: str
+
+    config = DTOConfig(
+        forbid_unknown_fields=forbid_unknown_fields,
+        experimental_codegen_backend=use_experimental_dto_backend,
+    )
+    dto = DataclassDTO[Annotated[Foo, config]]
+
+    @post(dto=dto, signature_types=[Foo])
+    def handler(data: Foo) -> Foo:
+        return data
+
+    with create_test_client(route_handlers=[handler]) as client:
+        response = client.post("/", json={"bar": "hello", "baz": "given"})
+        assert response.status_code == expected_status_code
